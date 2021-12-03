@@ -1,0 +1,142 @@
+#!fsharp
+
+#r "nuget: Deedle"
+#r "nuget: FSharp.Stats"
+#r "nuget: Plotly.NET, 2.0.0-preview.12"
+#r "nuget: Plotly.NET.Interactive, 2.0.0-preview.12"
+#r "nuget: FSharp.Data"
+#r "nuget: Microsoft.Net.Http, 2.2.29"
+#r "nuget: CsvHelper"
+#r "nuget: FSharpPlus, 1.2.2"
+
+#!fsharp
+
+// Opening modules
+open FSharp.Data
+open Deedle
+open System.Net.Http
+open System.IO.Compression
+open System.Threading.Tasks
+open CsvHelper
+open System.Globalization
+open System.IO
+open CsvHelper.Configuration
+open Plotly.NET
+open FSharpPlus.Data
+open FSharpPlus.Operators
+
+#!fsharp
+
+/// Final objective: we want to show a general overview of how to do a fast analisys over a streammed compressed file:
+/// we will be downloading, decompressing, parsing and analizyng the data, the whole thing on the fly.
+
+// We define many small functions and we can combine the functions like small lego pieces.
+
+// Get the stream from the uri (file http address), to download the content ofthe file
+let download  (uri: String) scoped  =
+    task {
+        Console.WriteLine(uri)
+        use client = new HttpClient()
+        let! stream = client.GetStreamAsync(uri)
+        return! scoped stream
+    }
+
+
+// Decompres the content from one stream and offer the decompressed stream to neext function
+let decompressStream stream scoped   =
+    task {
+        use decompressedStream = new GZipStream(stream, CompressionMode.Decompress)
+        return! scoped decompressedStream
+    }
+
+
+// Parse the content from one stream and offer the parsed content as a seq of objects to the next function
+let parseCSV<'t, 'r>(stream: Stream)  (scoped: seq<'t> -> 'r)  =
+    task {
+        use reader =  new StreamReader(stream)
+        let csvConfig = CsvConfiguration(CultureInfo.InvariantCulture, Delimiter = "\t", BadDataFound = null )
+        use csvReader = new CsvReader(reader,  csvConfig)
+        return scoped (csvReader.GetRecords<'t> ())
+    }
+
+let inline (^!+>)
+    (left:  'le -> ('re -> 'rr) -> 'lr)
+    (right: 're -> ('se -> 'sr) -> 'rr) =
+        fun leftEffects scoped -> 
+            (fun rightEffects -> right rightEffects scoped) |> left leftEffects
+
+let downloadAndProcess<'t, 'r> =
+    download ^!+> decompressStream ^!+> parseCSV<'t, 'r>
+ 
+let inline firstN n =
+    Seq.truncate n >> toArray
+
+let inline result (task: Task<'t>) = task.Result
+
+#!fsharp
+
+type Principal = { tconst:  string; ordering: int; category: string; job: string; characters: string}
+
+#!fsharp
+
+let imdbToValue filename scoped =
+    downloadAndProcess $"https://datasets.imdbws.com/{filename}.tsv.gz" scoped
+
+let imdbToArray filename scoped  =
+    imdbToValue filename (scoped >> firstN 1000)
+
+#!fsharp
+
+// We are defining the function responsible to analyzed the seq of objects and get the desired result
+
+// Getting the different job titles in the movies industry
+let getJobs = 
+    map (fun it -> it.job) >> distinct >> sort
+    
+imdbToArray "title.principals" getJobs |> result
+
+#!fsharp
+
+// Counting principal (workers) from all the movies in the database
+
+let inline countRows source =
+    fold (fun count row -> count + 1) 0 source
+    
+imdbToValue "title.principals" countRows |> result
+
+#!fsharp
+
+// We are defining a new combinator
+
+let foldBy (mapKey: 'T -> 'Key) (folder: 'KeyedState -> 'T -> 'KeyedState) (state: 'KeyedState) =
+    let outerFolder (outerState: Map<'Key, 'KeyedState>) it =
+        let key = mapKey it
+        let keyedState = outerState.TryFind key |> Option.defaultValue state
+        let newSubState = folder keyedState it3
+        outerState.Add(key, newSubState)
+    fold outerFolder Map.empty
+
+
+let inline countBy keySelector =
+    foldBy keySelector (fun c it -> c + 1) 0
+
+let countByCategory = 
+    countBy (fun it -> it.category) >> Seq.sortByDescending (fun it -> it.Value)
+
+let r = imdbToArray "title.principals" countByCategory |> result
+
+#!fsharp
+
+r
+
+#!fsharp
+
+let y = r |> map (fun it -> it.Key)
+let x = r |> map (fun it -> it.Value)
+Chart.Column(x,y)
+|> Chart.withTitle("# of principals by category")
+
+#!fsharp
+
+Chart.Doughnut(x,y)
+|> Chart.withTitle("# of principals by category")
